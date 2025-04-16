@@ -1,8 +1,12 @@
 from elasticsearch import Elasticsearch
 
 es = Elasticsearch(
-    hosts=["https://open-university-sear-4132308520.ap-southeast-2.bonsaisearch.net"],
-    http_auth=("3pwadlnjvm", "e82nqrvykx"),  # dùng http_auth cho elasticsearch 7.x
+    "https://open-university-sear-4132308520.ap-southeast-2.bonsaisearch.net",
+    http_auth=("3pwadlnjvm", "e82nqrvykx")
 )
 
-
+# Kiểm tra kết nối
+try:
+    print(es.info())
+except Exception as e:
+    print("❌ Elasticsearch connection failed:", e)
