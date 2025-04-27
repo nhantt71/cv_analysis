@@ -8,8 +8,16 @@ from utils.embedding import generate_embedding
 from es import es
 from scipy.spatial.distance import cosine
 from db.job_postgres_module import get_all_jobs
+from utils.parser import clean_text_for_nlp
+import sys
+import json
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 app = FastAPI()
+
+import logging
+logging.basicConfig(level=logging.DEBUG)
 
 
 class CVTextRequest(BaseModel):
@@ -24,7 +32,7 @@ class RecommendJobsRequest(BaseModel):
 class RecommendCandidatesRequest(BaseModel):
     job_title: str
     description: str
-    top_k: Optional[int] = None
+    top_k: Optional[int] = 1000
 
 
 class SearchCandidatesRequest(BaseModel):
@@ -38,30 +46,46 @@ class SearchCandidatesRequest(BaseModel):
     top_k: Optional[int] = None
 
 
+
+
+@app.get("/")
+def hello_world():
+    return {"Hello": "World"}
+
+
+
 @app.post("/parse-cv")
 def parse_cv_text(request: CVTextRequest, req: Request):
-    email = req.query_params.get("email")
+    try:
+        email = req.query_params.get("email")
+        cleaned_text = clean_text_for_nlp(request.text)
 
-    result = analyze_cv_info(request.text)
+        result = analyze_cv_info(cleaned_text, email)
 
-    # Generate embedding from key CV sections
-    text = f"{result['skills']} {result['experience']} {result['education']} {result['languages']}"
-    vector = generate_embedding(text)
-
-    # Store in Elasticsearch (single operation)
-    es.index(
-        index="cv_index",
-        body={
-            **result,
-            "email": email,
-            "cv_vector": vector
+        formatted_result = {
+            "status": "success",
+            "data": {
+                "email": email,
+                "education": result["education"],
+                "experience": result["experience"],
+                "languages": result["languages"],
+                "skills": result["skills"]
+            }
         }
-    )
 
-    return {
-        "status": "success",
-        "data": result
-    }
+        print(json.dumps(formatted_result, indent=4))
+
+        text = f"{result['skills']} {result['experience']} {result['education']} {result['languages']}"
+        vector = generate_embedding(text)
+
+        es.index(
+            index="cv_index",
+            body={**result, "cv_vector": vector}
+        )
+
+        return formatted_result
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def cosine_similarity(v1, v2):
@@ -69,37 +93,37 @@ def cosine_similarity(v1, v2):
 
 
 @app.get("/recommend-jobs")
-def recommend_jobs_for_candidate(email: str, top_k: int = 10):
-    # 1. Lấy vector CV từ Elasticsearch theo email
+def recommend_jobs_for_candidate(email: str, top_k: int = 30):
     res = es.search(index="cv_index", body={
         "query": {
             "term": {
-                "email.keyword": email
+                "email": email
             }
         }
     })
+
 
     if not res["hits"]["hits"]:
         return {"error": "CV not found for this email."}
 
     cv_vector = res["hits"]["hits"][0]["_source"]["cv_vector"]
 
-    # 2. Lấy tất cả job từ PostgreSQL
-    jobs = get_all_jobs()  # [{id, detail, experience, ...}, ...]
+    jobs = get_all_jobs()
 
-    # 3. Tính similarity
+    #Calculate similarity
     scored_jobs = []
     for job in jobs:
         job_text = f"{job['detail']} {job['experience']}"
         job_vector = generate_embedding(job_text)
 
         similarity = cosine_similarity(cv_vector, job_vector)
-        scored_jobs.append({
-            **job,
-            "similarity": similarity
-        })
 
-    # 4. Sắp xếp và lấy top_k
+        if similarity > 0.2:
+            scored_jobs.append({
+                **job,
+                "similarity": similarity
+            })
+
     top_jobs = sorted(scored_jobs, key=lambda x: x["similarity"], reverse=True)[:top_k]
 
     return {
@@ -107,23 +131,26 @@ def recommend_jobs_for_candidate(email: str, top_k: int = 10):
     }
 
 
-@app.post("/recommend-candidates")
+
+@app.get("/recommend-candidates")
 def recommend_candidates(req: RecommendCandidatesRequest):
     text = f"{req.job_title} {req.description}"
     vector = generate_embedding(text)
 
     knn_query = {
         "knn": {
-            "cv_vector": {
-                "vector": vector,
-                "k": 1000,
-                "num_candidates": 1000
-            }
+            "field": "cv_vector",
+            "query_vector": vector,
+            "k": 100,
+            "num_candidates": 100
         }
     }
 
     res = es.search(index="cv_index", body={
-        "size": req.top_k or 1000,
+        "size": req.top_k,
+        "_source":{
+            "excludes": ["cv_vector"]
+        },
         "query": knn_query
     })
 
@@ -135,7 +162,6 @@ def recommend_candidates(req: RecommendCandidatesRequest):
 @app.post("/search-candidates")
 def search_candidates(req: SearchCandidatesRequest):
     search_text = " ".join([
-        req.gender or "",
         req.experience or "",
         req.skill or "",
         req.language or "",
@@ -151,16 +177,18 @@ def search_candidates(req: SearchCandidatesRequest):
 
     knn_query = {
         "knn": {
-            "cv_vector": {
-                "vector": vector,
-                "k": 1000,
-                "num_candidates": 1000
-            }
+            "field": "cv_vector",
+            "query_vector": vector,
+            "k": 100,
+            "num_candidates": 100
         }
     }
 
     res = es.search(index="cv_index", body={
         "size": req.top_k or 1000,
+        "_source": {
+            "excludes": ["cv_vector"]
+        },
         "query": knn_query
     })
 
